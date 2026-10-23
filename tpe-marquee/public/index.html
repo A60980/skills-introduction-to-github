@@ -44,12 +44,15 @@ function render() {
   const list = flights.filter(f => (f.terminal === 'T1' || f.terminal === 'T2') && (!filter || f.terminal === filter));
   if (!list.length) { track.innerHTML = '<span class="item">目前沒有班機資料</span>'; return; }
   track.innerHTML = list.map(f => {
+    const cancelled = cls(f.status) === 'bad';
     const changed = f.estimated && f.estimated !== f.scheduled;
-    const time = changed ? `<s>${esc(f.scheduled)}</s> → ${esc(f.estimated)}` : esc(f.scheduled);
+    const time = cancelled ? `<s>${esc(f.scheduled)}</s>`
+      : changed ? `<s>${esc(f.scheduled)}</s> → ${esc(f.estimated)}` : esc(f.scheduled);
+    const belt = f.carousel ? `<span class="time">轉盤 ${esc(f.carousel)}</span>` : '';
     return `<span class="item"><span class="tag ${f.terminal}">${f.terminal}</span>` +
       `<span class="flight">${esc(f.flight)}</span>${esc(f.airline)}` +
       `<span class="time">${esc(f.origin)} ${time}</span>` +
-      `<span class="${cls(f.status)}">${esc(f.status)}</span></span>`;
+      belt + `<span class="${cls(f.status)}">${esc(f.status)}</span></span>`;
   }).join('');
   track.style.setProperty('--dur', Math.max(30, list.length * 6) + 's');
 }
