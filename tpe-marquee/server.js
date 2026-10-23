@@ -1,14 +1,22 @@
 // 桃園機場 T1/T2 客機抵達跑馬燈 — 後端
 // 無外部套件，Node 18+。
 //   DEMO=1 node server.js                       用示範資料
-//   SOURCE_URL=<資料網址> node server.js         用真實資料（JSON 或 CSV）
+//   TDX_CLIENT_ID=… TDX_CLIENT_SECRET=… node server.js   用 TDX 即時航班（建議）
+//   SOURCE_URL=<資料網址> node server.js         用其他來源（JSON 或 CSV）
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
 const PORT = process.env.PORT || 3000;
 const SOURCE_URL = process.env.SOURCE_URL || '';
-const DEMO = process.env.DEMO === '1' || !SOURCE_URL;
+const TDX_ID = process.env.TDX_CLIENT_ID || '';
+const TDX_SECRET = process.env.TDX_CLIENT_SECRET || '';
+const TDX = Boolean(TDX_ID && TDX_SECRET);
+const TDX_HOST = process.env.TDX_HOST || 'https://tdx.transportdata.tw';
+const TDX_TOKEN_URL = process.env.TDX_TOKEN_URL || TDX_HOST + '/auth/realms/TDXConnect/protocol/openid-connect/token';
+const AIRPORT = process.env.AIRPORT || 'TPE';
+const DEMO = process.env.DEMO === '1' || (!SOURCE_URL && !TDX);
+const TIMEOUT_MS = 15000;
 const REFRESH_MS = Number(process.env.REFRESH_MS || 60000);
 
 // 各欄位可能的名稱（中/英），依序嘗試；來源欄位不同時改這裡即可
@@ -39,13 +47,15 @@ function parseCSV(text) {
   return body.filter(r => r.length > 1).map(r => Object.fromEntries(head.map((h, i) => [h.trim().replace(/^﻿/, ''), r[i]])));
 }
 
+const hhmm = v => (String(v || '').match(/\d{1,2}:\d{2}/) || [''])[0];
+
 function normalize(raw) {
   const t = pick(raw, FIELDS.terminal);
   const terminal = /2/.test(t) ? 'T2' : /1/.test(t) ? 'T1' : '';
   return {
     airline: pick(raw, FIELDS.airline), flight: pick(raw, FIELDS.flight), terminal,
-    origin: pick(raw, FIELDS.origin), scheduled: pick(raw, FIELDS.scheduled),
-    estimated: pick(raw, FIELDS.estimated), status: pick(raw, FIELDS.status),
+    origin: pick(raw, FIELDS.origin), scheduled: hhmm(pick(raw, FIELDS.scheduled)) || pick(raw, FIELDS.scheduled),
+    estimated: hhmm(pick(raw, FIELDS.estimated)) || pick(raw, FIELDS.estimated), status: pick(raw, FIELDS.status),
     carousel: pick(raw, FIELDS.carousel),
   };
 }
@@ -65,12 +75,71 @@ function demoData() {
     ({ airline, flight, terminal, origin, scheduled: hm(s), estimated: hm(e), status, carousel: '' }));
 }
 
+
+// ---- TDX（運輸資料流通服務）----
+let token = { value: '', exp: 0 };
+let names = { airline: null, airport: null, at: 0 };
+
+async function getJSON(url, opts = {}) {
+  const res = await fetch(url, { ...opts, signal: AbortSignal.timeout(TIMEOUT_MS) });
+  if (res.status === 429) { const e = new Error('TDX 429 rate limited'); e.rateLimited = true; throw e; }
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${url.split('?')[0]}`);
+  return res.json();
+}
+
+async function tdxToken() {
+  if (token.value && Date.now() < token.exp - 60000) return token.value;
+  const j = await getJSON(TDX_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ grant_type: 'client_credentials', client_id: TDX_ID, client_secret: TDX_SECRET }),
+  });
+  token = { value: j.access_token, exp: Date.now() + (j.expires_in || 3600) * 1000 };
+  return token.value;
+}
+
+const tdxGet = async path => getJSON(`${TDX_HOST}/api/basic${path}${path.includes('?') ? '&' : '?'}$format=JSON`,
+  { headers: { Authorization: 'Bearer ' + await tdxToken() } });
+
+// 航空公司 / 機場代碼 → 中文名，一天更新一次
+async function loadNames() {
+  if (names.airline && Date.now() - names.at < 86400000) return;
+  const [al, ap] = await Promise.all([tdxGet('/v2/Air/Airline'), tdxGet('/v2/Air/Airport')]);
+  names = {
+    airline: Object.fromEntries(al.map(a => [a.AirlineID, a.AirlineName?.Zh_tw || a.AirlineName?.En || a.AirlineID])),
+    airport: Object.fromEntries(ap.map(a => [a.AirportID, a.AirportName?.Zh_tw || a.AirportName?.En || a.AirportID])),
+    at: Date.now(),
+  };
+}
+
+async function tdxFlights() {
+  await loadNames().catch(e => { if (!names.airline) names = { airline: {}, airport: {}, at: 0 }; console.error('names:', e.message); });
+  const list = await tdxGet(process.env.TDX_PATH || `/v2/Air/FIDS/Airport/${AIRPORT}`);
+  return list
+    .filter(f => !f.ArrivalAirportID || f.ArrivalAirportID === AIRPORT) // 只留抵達本機場
+    .map(f => {
+      const no = String(f.FlightNumber || '');
+      return normalize({
+        airlineName: names.airline[f.AirlineID] || f.AirlineID,
+        flightNo: /^\d/.test(no) ? (f.AirlineID || '') + no : no,
+        terminal: f.Terminal,
+        origin: names.airport[f.DepartureAirportID] || f.DepartureAirportID,
+        scheduledTime: f.ScheduleArrivalTime,
+        estimatedTime: f.ActualArrivalTime || f.EstimatedArrivalTime,
+        status: f.ArrivalRemark || f.AirRemark || f.Remark,
+        carousel: f.BaggageClaim,
+      });
+    })
+    .sort((a, b) => (a.scheduled || '').localeCompare(b.scheduled || ''));
+}
+
 let cache = { updatedAt: null, flights: [], error: null };
 
 async function refresh() {
   try {
     let flights;
     if (DEMO) flights = demoData();
+    else if (TDX) flights = await tdxFlights();
     else {
       const res = await fetch(SOURCE_URL, { headers: { 'User-Agent': 'Mozilla/5.0' } });
       if (!res.ok) throw new Error('upstream HTTP ' + res.status);
@@ -85,6 +154,7 @@ async function refresh() {
     cache = { updatedAt: new Date().toISOString(), flights: flights.filter(f => f.flight), error: null };
   } catch (e) {
     cache.error = String(e.message || e); // 失敗時保留舊資料
+    if (e.rateLimited) nextDelay = REFRESH_MS * 5; // 被限流就放慢
     console.error('refresh failed:', cache.error);
   }
 }
@@ -102,7 +172,11 @@ http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': TYPES[path.extname(file)] || 'application/octet-stream' });
     res.end(buf);
   });
-}).listen(PORT, () => console.log(`marquee on http://localhost:${PORT}  (${DEMO ? 'DEMO' : SOURCE_URL})`));
+}).listen(PORT, () => console.log(`marquee on http://localhost:${PORT}  (${DEMO ? 'DEMO' : TDX ? 'TDX ' + AIRPORT : SOURCE_URL})`));
 
-refresh();
-setInterval(refresh, REFRESH_MS);
+let nextDelay = REFRESH_MS;
+(async function loop() {
+  nextDelay = REFRESH_MS;
+  await refresh();
+  setTimeout(loop, nextDelay);
+})();
