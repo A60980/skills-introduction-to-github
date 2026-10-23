@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>桃園機場 客機抵達跑馬燈</title>
+<style>
+  :root { --bg:#0b1f2a; --fg:#e8f4f8; --muted:#7fa3b3; --ok:#4ade80; --warn:#fbbf24; --bad:#f87171; --t1:#38bdf8; --t2:#fb923c; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family:system-ui,"Noto Sans TC",sans-serif; }
+  header { display:flex; justify-content:space-between; align-items:center; padding:12px 16px; font-size:14px; color:var(--muted); }
+  header b { color:var(--fg); font-size:18px; }
+  .tabs button { background:none; border:1px solid var(--muted); color:var(--muted); border-radius:6px; padding:4px 10px; margin-left:6px; cursor:pointer; }
+  .tabs button.on { color:var(--bg); background:var(--fg); border-color:var(--fg); }
+  .bar { overflow:hidden; white-space:nowrap; background:#10303f; border-block:2px solid #1e4a5e; padding:14px 0; }
+  .track { display:inline-block; padding-left:100%; animation:scroll var(--dur,60s) linear infinite; }
+  .bar:hover .track { animation-play-state:paused; }
+  @keyframes scroll { to { transform:translateX(-100%); } }
+  .item { display:inline-block; margin-right:48px; font-size:28px; }
+  .tag { font-weight:700; border-radius:4px; padding:0 8px; margin-right:10px; color:var(--bg); }
+  .T1 { background:var(--t1); } .T2 { background:var(--t2); }
+  .flight { font-weight:700; margin-right:10px; }
+  .time { color:var(--muted); margin:0 10px; }
+  .time s { opacity:.6; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); }
+  #msg { padding:8px 16px; color:var(--warn); font-size:14px; }
+</style>
+</head>
+<body>
+<header>
+  <div><b>桃園機場 客機抵達</b> <span id="meta"></span></div>
+  <div class="tabs"><button data-t="">全部</button><button data-t="T1">T1</button><button data-t="T2">T2</button></div>
+</header>
+<div class="bar"><div class="track" id="track"></div></div>
+<div id="msg"></div>
+<script>
+const track = document.getElementById('track'), meta = document.getElementById('meta'), msg = document.getElementById('msg');
+let flights = [], filter = new URLSearchParams(location.search).get('t') || '';
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const cls = s => /取消|cancel/i.test(s) ? 'bad' : /更改|延誤|delay|change/i.test(s) ? 'warn' : 'ok';
+
+function render() {
+  document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('on', b.dataset.t === filter));
+  const list = flights.filter(f => (f.terminal === 'T1' || f.terminal === 'T2') && (!filter || f.terminal === filter));
+  if (!list.length) { track.innerHTML = '<span class="item">目前沒有班機資料</span>'; return; }
+  track.innerHTML = list.map(f => {
+    const changed = f.estimated && f.estimated !== f.scheduled;
+    const time = changed ? `<s>${esc(f.scheduled)}</s> → ${esc(f.estimated)}` : esc(f.scheduled);
+    return `<span class="item"><span class="tag ${f.terminal}">${f.terminal}</span>` +
+      `<span class="flight">${esc(f.flight)}</span>${esc(f.airline)}` +
+      `<span class="time">${esc(f.origin)} ${time}</span>` +
+      `<span class="${cls(f.status)}">${esc(f.status)}</span></span>`;
+  }).join('');
+  track.style.setProperty('--dur', Math.max(30, list.length * 6) + 's');
+}
+
+async function load() {
+  try {
+    const r = await (await fetch('/api/arrivals')).json();
+    flights = r.flights;
+    meta.textContent = (r.demo ? '【示範資料】' : '') + '更新於 ' + (r.updatedAt ? new Date(r.updatedAt).toLocaleTimeString('zh-TW', {hour12:false}) : '--');
+    msg.textContent = r.error ? '資料來源暫時異常，顯示上次資料：' + r.error : '';
+    render();
+  } catch (e) { msg.textContent = '無法連線到伺服器'; }
+}
+document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => { filter = b.dataset.t; render(); });
+load(); setInterval(load, 30000);
+</script>
+</body>
+</html>
